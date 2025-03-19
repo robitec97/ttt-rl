@@ -11,11 +11,26 @@
 #define NN_OUTPUT_SIZE 9
 #define LEARNING_RATE 0.1
 
+// MCTS parameters
+#define MCTS_SIMULATIONS 1000
+#define UCB_CONSTANT 1.414f  // Exploration parameter, using the most common used value
+
 // Game board representation.
 typedef struct {
     char board[9];          // Can be "." (empty) or "X", "O".
     int current_player;     // 0 for player (X), 1 for computer (O).
 } GameState;
+
+// MCTS node structure
+typedef struct MCTSNode {
+    GameState state;           // Game state at this node
+    int visits;                // Number of times this node has been visited
+    float score;               // Total score from simulations
+    int move;                  // Move that led to this state (-1 for root)
+    int num_children;          // Number of child nodes
+    struct MCTSNode **children;// Array of child nodes
+    int expanded;              // Flag to indicate if node is expanded
+} MCTSNode;
 
 /* Neural network structure. For simplicity we have just
  * one hidden layer and fixed sizes (see defines above).
@@ -512,9 +527,8 @@ void play_game(NeuralNetwork *nn) {
     learn_from_game(nn, move_history, num_moves, 1, winner);
 }
 
-/* Get a random valid move, this is used for training
- * against a random opponent. Note: this function will loop forever
- * if the board is full, but here we want simple code. */
+/* Get a random valid move.
+ * Note: this function will loop forever if the board is full. */
 int get_random_move(GameState *state) {
     while(1) {
         int move = rand() % 9;
@@ -523,21 +537,229 @@ int get_random_move(GameState *state) {
     }
 }
 
-/* Play a game against random moves and learn from it.
+/* Create a new MCTS node with the given state */
+MCTSNode* mcts_create_node(GameState state, int move) {
+    MCTSNode *node = (MCTSNode*)malloc(sizeof(MCTSNode));
+    node->state = state;
+    node->visits = 0;
+    node->score = 0.0f;
+    node->move = move;
+    node->num_children = 0;
+    node->children = NULL;
+    node->expanded = 0;
+    return node;
+}
+
+/* Free a MCTS node and all its children recursively */
+void mcts_free_node(MCTSNode *node) {
+    if (node == NULL) return;
+    
+    // First free all children recursively
+    for (int i = 0; i < node->num_children; i++) {
+        mcts_free_node(node->children[i]);
+    }
+    
+    // Free the children array
+    if (node->children != NULL) {
+        free(node->children);
+    }
+    
+    // Free the node itself
+    free(node);
+}
+
+/* Count the number of valid moves in a game state */
+int count_valid_moves(GameState *state) {
+    int count = 0;
+    for (int i = 0; i < 9; i++) {
+        if (state->board[i] == '.') {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Expand a node by creating all possible child nodes */
+void mcts_expand_node(MCTSNode *node) {
+    if (node->expanded) return;
+    
+    int valid_moves = count_valid_moves(&node->state);
+    if (valid_moves == 0) return;  // No valid moves, can't expand
+    
+    node->children = (MCTSNode**)malloc(valid_moves * sizeof(MCTSNode*));
+    node->num_children = valid_moves;
+    
+    int child_idx = 0;
+    for (int move = 0; move < 9; move++) {
+        if (node->state.board[move] != '.') continue;
+        
+        // Create new game state with this move
+        GameState new_state = node->state;
+        char symbol = (new_state.current_player == 0) ? 'X' : 'O';
+        new_state.board[move] = symbol;
+        new_state.current_player = !new_state.current_player;
+        
+        // Create child node
+        node->children[child_idx] = mcts_create_node(new_state, move);
+        child_idx++;
+    }
+    
+    node->expanded = 1;
+}
+
+/* Calculate the UCB score for a node */
+float calculate_ucb(MCTSNode *node, int parent_visits) {
+    if (node->visits == 0) {
+        return FLT_MAX;  // Encourage exploring nodes that haven't been visited
+    }
+    
+    // UCB formula: exploitation + exploration
+    float exploitation = node->score / node->visits;
+    float exploration = UCB_CONSTANT * sqrt(log(parent_visits) / node->visits);
+    
+    return exploitation + exploration;
+}
+
+/* Select the best child node according to UCB scores */
+MCTSNode* mcts_select_best_child(MCTSNode *node) {
+    float best_score = -FLT_MAX;
+    MCTSNode *best_child = NULL;
+    
+    for (int i = 0; i < node->num_children; i++) {
+        float ucb = calculate_ucb(node->children[i], node->visits);
+        if (ucb > best_score) {
+            best_score = ucb;
+            best_child = node->children[i];
+        }
+    }
+    
+    return best_child;
+}
+
+/* Perform a simulation from the given state to the end of the game */
+float mcts_simulate(GameState state) {
+    char winner = 0;
+    
+    // Play the game randomly until it's over
+    while (!check_game_over(&state, &winner)) {
+        int move = get_random_move(&state);
+        char symbol = (state.current_player == 0) ? 'X' : 'O';
+        state.board[move] = symbol;
+        state.current_player = !state.current_player;
+    }
+    
+    // Score from the perspective of the player who started the simulation
+    int starting_player = !state.current_player;  // The player who just played is the opposite
+    
+    if (winner == 'T') {
+        return 0.5f;  // Tie
+    } else if ((winner == 'X' && starting_player == 0) || 
+               (winner == 'O' && starting_player == 1)) {
+        return 1.0f;  // Win
+    } else {
+        return 0.0f;  // Loss
+    }
+}
+
+/* Backpropagate the simulation result through the tree */
+void mcts_backpropagate(MCTSNode *node, float score) {
+    while (node != NULL) {
+        node->visits++;
+        
+        // Flip the score when moving up the tree since players alternate
+        node->score += score;
+        score = 1.0f - score;
+        
+        // For this implementation, we don't track parents, so we stop here
+        break;
+    }
+}
+
+/* Perform one iteration of the MCTS algorithm */
+void mcts_iterate(MCTSNode *root) {
+    // 1. Selection: traverse the tree to find the most promising leaf node
+    MCTSNode *node = root;
+    while (node->expanded && node->num_children > 0) {
+        node = mcts_select_best_child(node);
+    }
+    
+    // Check if game is over at this node
+    char winner = 0;
+    if (check_game_over(&node->state, &winner)) {
+        // Game is over, backpropagate the result
+        float score;
+        if (winner == 'T') {
+            score = 0.5f;  // Tie
+        } else if ((winner == 'X' && node->state.current_player == 1) || 
+                  (winner == 'O' && node->state.current_player == 0)) {
+            score = 1.0f;  // Win for the player who just moved
+        } else {
+            score = 0.0f;  // Loss for the player who just moved
+        }
+        
+        mcts_backpropagate(node, score);
+        return;
+    }
+    
+    // 2. Expansion: create all possible child nodes
+    mcts_expand_node(node);
+    
+    // If no children were created, simulate from current node
+    if (node->num_children == 0) {
+        float score = mcts_simulate(node->state);
+        mcts_backpropagate(node, score);
+        return;
+    }
+    
+    // 3. Simulation: choose a random child and simulate
+    int child_idx = rand() % node->num_children;
+    MCTSNode *child = node->children[child_idx];
+    
+    // 4. Simulation: play the game randomly to the end
+    float score = mcts_simulate(child->state);
+    
+    // 5. Backpropagation: update statistics
+    child->visits++;
+    child->score += score;
+    mcts_backpropagate(node, 1.0f - score);  // Parent gets opposite score
+}
+
+/* Get the best move using MCTS */
+int get_mcts_move(GameState *state) {
+    // Create root node
+    MCTSNode *root = mcts_create_node(*state, -1);
+    
+    // Run MCTS simulations
+    for (int i = 0; i < MCTS_SIMULATIONS; i++) {
+        mcts_iterate(root);
+    }
+    
+    // Find the child with the highest number of visits
+    int best_move = -1;
+    int most_visits = -1;
+    
+    // First expand the root node if not already expanded
+    mcts_expand_node(root);
+    
+    for (int i = 0; i < root->num_children; i++) {
+        MCTSNode *child = root->children[i];
+        if (child->visits > most_visits) {
+            most_visits = child->visits;
+            best_move = child->move;
+        }
+    }
+    
+    // Clean up MCTS tree
+    mcts_free_node(root);
+    
+    return best_move;
+}
+
+/* The opponent is now MCTS instead of random moves
  *
- * This is a very simple Montecarlo Method applied to reinforcement
- * learning:
- *
- * 1. We play a complete random game (episode).
- * 2. We determine the reward based on the outcome of the game.
- * 3. We update the neural network in order to maximize future rewards.
- *
- * LEARNING OPPORTUNITY: while the code uses some Montecarlo-alike
- * technique, important results were recently obtained using
- * Montecarlo Tree Search (MCTS), where a tree structure repesents
- * potential future game states that are explored according to
- * some selection: you may want to learn about it. */
-char play_random_game(NeuralNetwork *nn, int *move_history, int *num_moves) {
+ * This provides a much stronger training partner than random play.
+ */
+char play_mcts_game(NeuralNetwork *nn, int *move_history, int *num_moves) {
     GameState state;
     char winner = 0;
     *num_moves = 0;
@@ -547,8 +769,8 @@ char play_random_game(NeuralNetwork *nn, int *move_history, int *num_moves) {
     while (!check_game_over(&state, &winner)) {
         int move;
 
-        if (state.current_player == 0) {  // Random player's turn (X)
-            move = get_random_move(&state);
+        if (state.current_player == 0) {  // MCTS player's turn (X)
+            move = get_mcts_move(&state);
         } else {  // Neural network's turn (O)
             move = get_computer_move(&state, nn, 0);
         }
@@ -568,30 +790,30 @@ char play_random_game(NeuralNetwork *nn, int *move_history, int *num_moves) {
     return winner;
 }
 
-/* Train the neural network against random moves. */
-void train_against_random(NeuralNetwork *nn, int num_games) {
+/* Train the neural network against MCTS. */
+void train_against_mcts(NeuralNetwork *nn, int num_games) {
     int move_history[9];
     int num_moves;
     int wins = 0, losses = 0, ties = 0;
 
-    printf("Training neural network against %d random games...\n", num_games);
+    printf("Training neural network against %d MCTS games...\n", num_games);
 
     int played_games = 0;
     for (int i = 0; i < num_games; i++) {
-        char winner = play_random_game(nn, move_history, &num_moves);
+        char winner = play_mcts_game(nn, move_history, &num_moves);
         played_games++;
 
-        // Accumulate statistics that are provided to the user (it's fun).
+        // Accumulate statistics that are provided to the user.
         if (winner == 'O') {
             wins++; // Neural network won.
         } else if (winner == 'X') {
-            losses++; // Random player won.
+            losses++; // MCTS player won.
         } else {
             ties++; // Tie.
         }
 
-        // Show progress every many games to avoid flooding the stdout.
-        if ((i + 1) % 10000 == 0) {
+        // Show progress every 1000 games (less frequent than before since MCTS is slower)
+        if ((i + 1) % 1000 == 0) {
             printf("Games: %d, Wins: %d (%.1f%%), "
                    "Losses: %d (%.1f%%), Ties: %d (%.1f%%)\n",
                   i + 1, wins, (float)wins * 100 / played_games,
@@ -607,17 +829,17 @@ void train_against_random(NeuralNetwork *nn, int num_games) {
 }
 
 int main(int argc, char **argv) {
-    int random_games = 150000; // Fast and enough to play in a decent way.
+    int mcts_games = 15000; // Default number of games - reduced because MCTS is more compute intensive
 
-    if (argc > 1) random_games = atoi(argv[1]);
+    if (argc > 1) mcts_games = atoi(argv[1]);
     srand(time(NULL));
 
     // Initialize neural network.
     NeuralNetwork nn;
     init_neural_network(&nn);
 
-    // Train against random moves.
-    if (random_games > 0) train_against_random(&nn, random_games);
+    // Train against MCTS opponent
+    if (mcts_games > 0) train_against_mcts(&nn, mcts_games);
 
     // Play game with human and learn more.
     while(1) {
